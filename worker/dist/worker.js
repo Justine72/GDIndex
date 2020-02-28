@@ -7,7 +7,7 @@ self.props = {
 	auth: false,
 	user: '',
 	pass: '',
-	upload: false,
+	upload: true,
     export_url: true,
     download_aria2: false,
     copy_on_forbidden: false,
