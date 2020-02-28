@@ -8,7 +8,10 @@ self.props = {
 	user: '',
 	pass: '',
 	upload: false,
-	lite: false
+    export_url: true,
+    download_aria2: false,
+    copy_on_forbidden: false,
+    copy_parent_id: ''
 };
 (function () {
   'use strict';
@@ -367,7 +370,7 @@ self.props = {
     }
 
     async getId(path, rootId = 'root') {
-      const toks = path.split('/').filter(Boolean);
+      const toks = path.split('/').map(t => t.replace('$_', '/')).filter(Boolean);
       let id = rootId;
 
       for (const tok of toks) {
@@ -439,10 +442,75 @@ self.props = {
       return this.delete(id);
     }
 
+    async copy(fileId, parentId, fileName = null) {
+      this.initializeClient();
+      const body = {};
+
+      if (parentId) {
+        body.parents = [parentId];
+      }
+
+      if (fileName) {
+        body.name = fileName;
+      }
+
+      return this.client.post(`files/${fileId}/copy`, {
+        json: body
+      }).json();
+    }
+
+    async existsInParent(name, parentId) {
+      await this.initializeClient();
+
+      const getList = () => {
+        const qs = {
+          includeItemsFromAllDrives: true,
+          supportsAllDrives: true,
+          q: `name = '${name}' and '${parentId}' in parents and trashed = false`,
+          orderBy: 'folder,name,modifiedTime desc',
+          fields: 'files(id,name,mimeType,size,modifiedTime),nextPageToken',
+          pageSize: 1
+        };
+        return this.client.get('files', {
+          qs
+        }).json();
+      };
+
+      const files = [];
+      const resp = await getList();
+      files.push(...resp.files);
+      const multipleFileExists = Boolean(resp.nextPageToken);
+      return {
+        file: files ? files[0] : null,
+        exists: Boolean(files.length),
+        multiple: multipleFileExists
+      };
+    }
+
   }
 
   const gd = new GoogleDrive(self.props);
-  const HTML = `<!DOCTYPE html><html lang=en><head><meta charset=utf-8><meta http-equiv=X-UA-Compatible content="IE=edge"><meta name=viewport content="width=device-width,initial-scale=1"><title>${self.props.title}</title><link href="/~_~_gdindex/resources/css/app.css" rel=stylesheet></head><body><script>window.props = { title: '${self.props.title}', default_root_id: '${self.props.default_root_id}', api: location.protocol + '//' + location.host, upload: ${self.props.upload} }<\/script><div id=app></div><script src="/~_~_gdindex/resources/js/app.js"><\/script></body></html>`;
+  const resourceBaseUrl = self.props.resource_base_url || 'https://raw.githubusercontent.com/CodeingBoy/GDIndex/master/web/dist/';
+  const HTML = `
+<!DOCTYPE html>
+<html lang=en>
+<head>
+<meta charset=utf-8><meta http-equiv=X-UA-Compatible content="IE=edge">
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>${self.props.title}</title>
+<link href="/~_~_gdindex/resources/css/app.css" rel=stylesheet>
+</head>
+<body>
+<script>window.props = { 
+	title: '${self.props.title}', default_root_id: '${self.props.default_root_id}', 
+	api: location.protocol + '//' + location.host, 
+	upload: ${self.props.upload},
+	export_url: ${self.props.export_url},
+	download_aria2: ${self.props.download_aria2}
+}<\/script>
+<div id=app></div><script src="/~_~_gdindex/resources/js/app.js"><\/script>
+</body>
+</html>`;
 
   async function onGet(request) {
     let {
@@ -452,7 +520,7 @@ self.props = {
 
     if (path.startsWith('/~_~_gdindex/resources/')) {
       const remain = path.replace('/~_~_gdindex/resources/', '');
-      const r = await fetch(`https://raw.githubusercontent.com/maple3142/GDIndex/master/web/dist/${remain}`);
+      const r = await fetch(`${resourceBaseUrl}${remain}`);
       return new Response(r.body, {
         headers: {
           'Content-Type': mime.getType(remain) + '; charset=utf-8',
@@ -486,7 +554,38 @@ self.props = {
       const isGoogleApps = result.mimeType.includes('vnd.google-apps');
 
       if (!isGoogleApps) {
-        const r = await gd.download(result.id, request.headers.get('Range'));
+        let r;
+
+        try {
+          r = await gd.download(result.id, request.headers.get('Range'));
+        } catch (e) {
+          if (e.toString().indexOf('Forbidden') !== -1 && self.props.copy_on_forbidden) {
+            // add id into copy filename, which prevents conflicting
+            const filename = result.name;
+            const copyFileName = result.id + '-' + filename; // try copy file, but do search first
+
+            const existInfo = await gd.existsInParent(copyFileName, self.props.copy_parent_id);
+            let copiedFileId;
+
+            if (existInfo.exists && !existInfo.multiple) {
+              copiedFileId = existInfo.file.id;
+            } else {
+              // has not copied file, copy it
+              const copiedFile = await gd.copy(result.id, self.props.copy_parent_id, copyFileName);
+              copiedFileId = copiedFile.id;
+            }
+
+            r = await gd.download(copiedFileId, request.headers.get('Range'));
+          } else {
+            // other error, return it
+            return new Response({
+              error: e
+            }, {
+              status: r.status
+            });
+          }
+        }
+
         const h = new Headers(r.headers);
         h.set('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(result.name)}`);
         return new Response(r.body, {
@@ -610,10 +709,6 @@ self.props = {
     return user === self.props.user && pass === self.props.pass;
   }
 
-  function encodePathComponent(path) {
-    return path.split('/').map(encodeURIComponent).join('/');
-  }
-
   async function handleRequest(request) {
     if (request.method === 'OPTIONS') // allow preflight request
       return new Response('', {
@@ -632,43 +727,6 @@ self.props = {
     request = Object.assign({}, request, new URL(request.url));
     request.pathname = request.pathname.split('/').map(decodeURIComponent).map(decodeURIComponent) // for some super special cases, browser will force encode it...   eg: +αあるふぁきゅん。 - +♂.mp3
     .join('/');
-
-    if (self.props.lite && request.pathname.endsWith('/')) {
-      // lite mode
-      const path = request.pathname;
-      let parent = encodePathComponent(path.split('/').slice(0, -2).join('/') + '/');
-      const {
-        files
-      } = await gd.listFolderByPath(path, self.props.default_root_id);
-      let fileht = '';
-
-      for (const f of files) {
-        const isf = f.mimeType === 'application/vnd.google-apps.folder';
-        const p = encodePathComponent(path + f.name);
-        fileht += `<li><a href="${p + (isf ? '/' : '')}">${f.name}</a></li>`;
-      }
-
-      const ht = `<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">
-<html>
-<head>
-<title>Index of ${path}</title>
-</head>
-<body>
-<h1>Index of ${path}</h1>
-<ul>
-<li><a href="${parent}"> Parent Directory</a></li>
-${fileht}
-</ul>
-</body>
-</html>`;
-      return new Response(ht, {
-        status: 200,
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8'
-        }
-      });
-    }
-
     let resp;
     if (request.method === 'GET') resp = await onGet(request);else if (request.method === 'POST') resp = await onPost(request);else if (request.method === 'PUT') resp = await onPut(request);else resp = new Response('', {
       status: 405
